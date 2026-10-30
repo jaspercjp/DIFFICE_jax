@@ -10,11 +10,12 @@ def dataArrange(var, idxval, dsize):
     var_2d = jnp.reshape(var_1d, dsize)
     return var_2d
 
-def extract_scale(scale_info):
+def extract_scale(scale_info, basal=False):
     # define the global parameter
     rho = 917
-    rho_w = 1030
-    gd = 9.8 * (1 - rho / rho_w)  # gravitational acceleration
+    rho_w = 1023
+    g = 9.8
+    gd = g * (1 - rho / rho_w)  # gravitational acceleration
     # load the scale information
     dmean, drange = scale_info
     lx0, ly0, u0, v0 = drange[0:4]
@@ -22,21 +23,39 @@ def extract_scale(scale_info):
     h0 = dmean[4]
     # find the maximum velocity and length scale
     u0m = lax.max(u0, v0)
-    l0m = lax.max(lx0, ly0)
-    # calculate the scale of viscosity and strain rate
-    mu0 = rho * gd * h0 * (l0m / u0m)
+    l0m = lax.min(lx0, ly0)
+
+    # calculate the scale of viscosity
+    if basal:
+        # mu0 = rho * g * h0 * (l0m / u0m) * 100
+        mu0 = rho * g * h0 * (l0m / u0m)
+    else:
+        mu0 = rho * gd * h0 * (l0m / u0m)
+
+    if basal:
+        c0 = (h0 * mu0) / (l0m**2)
+        # c0 = (h0 * mu0 * u0m) / (l0m**2)
+    else:
+        c0 = jnp.nan
+
+    # calculate scale of strain rate
     str0 = u0m/l0m
-    term0 = rho * gd * h0 ** 2 / l0m
+    if basal:
+        term0 = rho * g * h0 ** 2 / l0m
+    else:
+        term0 = rho * gd * h0 ** 2 / l0m
     # group characteristic scales for all different variables
     scale = dict(lx0=lx0, ly0=ly0, u0=u0, v0=v0, h0=h0,
                  lxm=lxm, lym=lym, um=um, vm=vm,
-                 mu0=mu0, str0=str0, term0=term0)
+                 mu0=mu0, str0=str0, term0=term0, c0=c0)
     return scale
 
-
-def predict(func_all, data_all, aniso=False):
+def predict(func_all, data_all, aniso=False, basal=False):
     # obtain the normalized dataset
-    x_star, y_star, u_star, v_star, xh_star, yh_star, h_star = data_all[4][2]
+    if basal:
+        x_star, y_star, u_star, v_star, xh_star, yh_star, h_star, s_star = data_all[4][2]
+    else:
+        x_star, y_star, u_star, v_star, xh_star, yh_star, h_star = data_all[4][2]
     # set the output position based on the original velocity data
     x_pred = jnp.hstack([x_star, y_star])
     # set the output position based on the original thickness data
@@ -48,19 +67,21 @@ def predict(func_all, data_all, aniso=False):
     dsize, dsize_h = data_all[4][-1]
     # extract the scale for different variables
     scale = data_all[4][0:2]
-    varscl = extract_scale(scale)
+    varscl = extract_scale(scale, basal=basal)
 
     # extract the function of solution and equation residue
     [f_u, f_gu, gov_eqn] = func_all
-    f_eqn = lambda x: gov_eqn(f_u, x, scale)
+    f_eqn = lambda x: gov_eqn(f_u, x, scale, basal=basal)
 
     # calculate the network output at the original velocity-data positions
     uvhm = f_u(x_pred)
     # calculate the network output at the original thickness-data positions
     h2 = f_u(xh_pred)[:, 2:3]
+    if basal:
+        s2 = f_u(xh_pred)[:,3:4]
 
     # set the partition number
-    nsp = 4
+    nsp = 32
     # separate input into different partition to avoid GPU memory limit
     x_psp = jnp.array_split(x_pred, nsp)
     idxsp = jnp.arange(nsp).tolist()
@@ -85,16 +106,26 @@ def predict(func_all, data_all, aniso=False):
     x_h = dataArrange(xh_star, idxval_h, dsize_h) * varscl['lx0'] + varscl['lxm']
     y_h = dataArrange(yh_star, idxval_h, dsize_h) * varscl['ly0'] + varscl['lym']
     h_data = dataArrange(h_star, idxval_h, dsize_h) * varscl['h0']
+    if basal:
+        s_data = dataArrange(s_star, idxval_h, dsize_h) * varscl['h0']
 
     # convert to 2D NN prediction
     u_p = dataArrange(uvhm[:, 0:1], idxval, dsize) * varscl['u0'] + varscl['um']
     v_p = dataArrange(uvhm[:, 1:2], idxval, dsize) * varscl['v0'] + varscl['vm']
     h_p = dataArrange(uvhm[:, 2:3], idxval, dsize) * varscl['h0']
-    h_p2 = dataArrange(h2, idxval_h, dsize_h) * varscl['h0']
-    mu_p = dataArrange(uvhm[:, 3:4], idxval, dsize) * varscl['mu0']
+    if basal:
+        s_p = dataArrange(uvhm[:, 3:4], idxval, dsize) * varscl['h0']
+        mu_p = dataArrange(uvhm[:, 4:5], idxval, dsize) * varscl['mu0']
+        c = dataArrange(uvhm[:, 5:6], idxval, dsize) * varscl['c0']
+        h_p2 = dataArrange(h2, idxval_h, dsize_h) * varscl['h0']
+        s_p2 = dataArrange(s2, idxval_h, dsize_h) * varscl['h0']
+    else:
+        mu_p = dataArrange(uvhm[:, 3:4], idxval, dsize) * varscl['mu0']
+        h_p2 = dataArrange(h2, idxval_h, dsize_h) * varscl['h0']
+
     if aniso:
         eta_p = dataArrange(uvhm[:, 4:5], idxval, dsize) * varscl['mu0']
-
+    
     # convert to 2D derivative of prediction
     ux_p = dataArrange(duvh[:, 0:1], idxval, dsize) * varscl['u0']/varscl['lx0']
     uy_p = dataArrange(duvh[:, 1:2], idxval, dsize) * varscl['u0']/varscl['ly0']
@@ -114,7 +145,12 @@ def predict(func_all, data_all, aniso=False):
     e21 = dataArrange(term[:, 3:4], idxval, dsize) * varscl['term0']
     e22 = dataArrange(term[:, 4:5], idxval, dsize) * varscl['term0']
     e23 = dataArrange(term[:, 5:6], idxval, dsize) * varscl['term0']
-    strate = dataArrange(term[:, -1:], idxval, dsize) * varscl['str0']
+    e14 = None 
+    e24 = None 
+    if basal:
+        e14 = dataArrange(term[:, 7:8], idxval, dsize) * varscl['term0']
+        e24 = dataArrange(term[:, 8:9], idxval, dsize) * varscl['term0']
+    strate = dataArrange(term[:, 6:7], idxval, dsize) * varscl['str0']
 
     # group all the variables
     results = {"x": x, "y": y, "u_g": u_data, "v_g": v_data,
@@ -127,5 +163,12 @@ def predict(func_all, data_all, aniso=False):
                "e1": e1, "e2": e2, "scale": varscl}
     if aniso:
         results['eta'] = eta_p
+    if basal:
+        results['c'] = c
+        results['e14']=e14 
+        results['e24']=e24
+        results['s']=s_p 
+        results['s2']=s_p2
+        results['s_g']=s_data
 
     return results

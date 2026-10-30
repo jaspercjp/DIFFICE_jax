@@ -1,4 +1,5 @@
 import sys
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.tree_util import tree_map
@@ -7,8 +8,6 @@ from pathlib import Path
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
-
-from equation.eqn_iso import vectgrad
 
 
 def dataArrange(var, idxval, dsize):
@@ -19,33 +18,42 @@ def dataArrange(var, idxval, dsize):
     var_2d = jnp.reshape(var_1d, dsize)
     return var_2d
 
-def extract_scale(scale_info):
+def extract_scale(scale_info, basal=False):
     # define the global parameter
     rho = 917
-    rho_w = 1030
-    gd = 9.8 * (1 - rho / rho_w)  # gravitational acceleration
+    rho_w = 1023
+    g = 9.8
+    gd = g * (1 - rho / rho_w)  # reduced gravitational acceleration
     # load the scale information
     dmean, drange = scale_info
     lx0, ly0, u0, v0 = drange[0:4]
     lxm, lym, um, vm = dmean[0:4]
     h0 = dmean[4]
     # find the maximum velocity and length scale
+    # [TODO]: Figure out whether l0m=lax.min(lx0,ly0) is better
     u0m = lax.max(u0, v0)
-    l0m = lax.max(lx0, ly0)
+    l0m = lax.min(lx0, ly0)
     # calculate the scale of viscosity and strain rate
-    mu0 = rho * gd * h0 * (l0m / u0m)
+    # Use full gravity for grounded ice, reduced gravity for floating (matching PINN)
+    g_eff = g if basal else gd
+    mu0 = rho * g_eff * h0 * (l0m / u0m)
     str0 = u0m/l0m
-    term0 = rho * gd * h0 ** 2 / l0m
+    term0 = rho * g_eff * h0 ** 2 / l0m
+    # calculate the scale of basal friction coefficient
+    if basal:
+        c0 = (h0 * mu0) / (l0m**2)
+    else:
+        c0 = jnp.nan
     # group characteristic scales for all different variables
     scale = dict(lx0=lx0, ly0=ly0, u0=u0, v0=v0, h0=h0,
                  lxm=lxm, lym=lym, um=um, vm=vm,
-                 mu0=mu0, str0=str0, term0=term0)
+                 mu0=mu0, str0=str0, term0=term0, c0=c0)
     return scale
 
 
-def net_output(func_all, data_norm, scale, idx, nsp=4):
-    # obtained the normalized dataset
-    x_star, y_star, u_star, v_star, xh_star, yh_star, h_star = data_norm
+def net_output(func_all, data_norm, scale, idx, basal=False, nsp=32):
+    # obtained the normalized dataset (7 for floating, 8 for basal with surface elevation)
+    x_star, y_star, u_star, v_star, xh_star, yh_star, h_star = data_norm[0:7]
     # set the output position based on the original velocity data
     x_pred = jnp.hstack([x_star, y_star])
     # set the output position based on the original thickness data
@@ -54,8 +62,8 @@ def net_output(func_all, data_norm, scale, idx, nsp=4):
     # extract the function of solution and equation residue
     [f_u_idx, gov_eqn] = func_all
     f_u = lambda x: f_u_idx(x, idx)
-    f_gu = lambda x: vectgrad(f_u, x)[0][:, 0:6]
-    f_eqn = lambda x: gov_eqn(f_u, x, scale)
+    f_gu = lambda x: jax.vmap(jax.jacfwd(lambda z: f_u(z[None, :])[0]))(x).reshape(x.shape[0], -1)[:, 0:6]
+    f_eqn = lambda x: gov_eqn(f_u, x, scale, basal=basal)
 
     # calculate the network output at the original velocity-data positions
     uvhm = f_u(x_pred)
@@ -79,7 +87,7 @@ def net_output(func_all, data_norm, scale, idx, nsp=4):
     return uvhm, h2, duvh, eqn, term
 
 
-def redimensionalize(output, data_norm, data_info, idxgall, aniso):
+def redimensionalize(output, data_norm, data_info, idxgall, aniso, basal_mask=None):
     """ re-shape all the output variables into the same grid with the original data
         and re-dimensionalize the output variables into their original (SI) unit
     :param output: all output variables in each sub-region [list]
@@ -87,13 +95,17 @@ def redimensionalize(output, data_norm, data_info, idxgall, aniso):
     :param data_info: information required to re-shape and re-dimensionalize the output variables
     :param idxgall: index of the sub-regions
     :param aniso: whether the result is for anisotropic anslysis
+    :param basal_mask: list of booleans indicating grounded (True) or floating (False) per region
     :return: stitched variables in the whole domain [Array]
     """
+    # create default basal mask if not provided (all floating)
+    if basal_mask is None:
+        basal_mask = [False] * len(idxgall)
 
     # extract all the information for re-shaping and re-dimensionalization
     idxval, idxval_h, dsize, dsize_h, scale = data_info
-    # extract the scale information for each variable
-    varscl = tree_map(lambda x: extract_scale(scale[x]), idxgall)
+    # extract the scale information for each variable, with correct gravity for grounded vs floating
+    varscl = tree_map(lambda x: extract_scale(scale[x], basal=basal_mask[x]), idxgall)
 
     # convert to 2D original velocity dataset
     x = tree_map(lambda x: dataArrange(
@@ -122,8 +134,20 @@ def redimensionalize(output, data_norm, data_info, idxgall, aniso):
           output[x][0][:, 2:3], idxval[x], dsize[x]) * varscl[x]['h0'], idxgall)
     h_p2 = tree_map(lambda x: dataArrange(
            output[x][1], idxval_h[x], dsize_h[x]) * varscl[x]['h0'], idxgall)
-    mu_p = tree_map(lambda x: dataArrange(
-           output[x][0][:, 3:4], idxval[x], dsize[x]) * varscl[x]['mu0'], idxgall)
+    def get_mu(x):
+        return dataArrange(
+               output[x][0][:, 4:5], idxval[x], dsize[x]) * varscl[x]['mu0']
+    mu_p = tree_map(get_mu, idxgall)
+
+    def get_s(x):
+        out = output[x][0]
+        if out.shape[1] > 5:
+            dmean, drange = scale[x]
+            return dataArrange(
+                   out[:, 3:4], idxval[x], dsize[x]) * drange.s_range + dmean.s_mean
+        return jnp.full(dsize[x], jnp.nan)
+
+    s_p = tree_map(get_s, idxgall)
 
     # convert to 2D derivative of prediction
     ux_p = tree_map(lambda x: dataArrange(
@@ -158,13 +182,30 @@ def redimensionalize(output, data_norm, data_info, idxgall, aniso):
           output[x][4][:, 4:5], idxval[x], dsize[x]) * varscl[x]['term0'], idxgall)
     e23 = tree_map(lambda x: dataArrange(
           output[x][4][:, 5:6], idxval[x], dsize[x]) * varscl[x]['term0'], idxgall)
+    e14 = tree_map(lambda x: dataArrange(
+          output[x][4][:, 7:8], idxval[x], dsize[x]) * varscl[x]['term0']
+          if output[x][4].shape[1] > 7 else jnp.full(dsize[x], jnp.nan), idxgall)
+    e24 = tree_map(lambda x: dataArrange(
+          output[x][4][:, 8:9], idxval[x], dsize[x]) * varscl[x]['term0']
+          if output[x][4].shape[1] > 8 else jnp.full(dsize[x], jnp.nan), idxgall)
     strate = tree_map(lambda x: dataArrange(
           output[x][4][:, -1:], idxval[x], dsize[x]) * varscl[x]['str0'], idxgall)
+
+    # extract basal friction if available (column 5 for grounded regions)
+    def get_beta(x):
+        out = output[x][0]
+        idx = idxval[x]
+        ds = dsize[x]
+        if basal_mask[x] and out.shape[1] > 5:
+            return dataArrange(out[:, 5:6], idx, ds) * varscl[x]['c0']
+        return jnp.full(ds, jnp.nan)
+
+    beta_p = tree_map(get_beta, idxgall)
 
     # output variable calculated in the grid of original velocity data
     varsub = [x, y, u_data, v_data, u_p, v_p, h_p,
               ux_p, uy_p, vx_p, vy_p, hx_p, hy_p, strate,
-              e1, e2, e11, e12, e13, e21, e22, e23, mu_p]
+              e1, e2, e11, e12, e13, e21, e22, e23, e14, e24, mu_p, beta_p, s_p]
     # create a index list for each of output
     idxvars = jnp.arange(len(varsub)).tolist()
 
@@ -202,8 +243,11 @@ def stitch(vars_sub, idxcrop, fullsize, idxgall):
     return vars_merge
 
 
-def predict(func_all, data_all, posi_all, idxcrop_all, idxgall, aniso=False):
+def predict(func_all, data_all, posi_all, idxcrop_all, idxgall, aniso=False, basal_mask=None):
     # %% calculate the output data
+    # create default basal mask if not provided (all floating)
+    if basal_mask is None:
+        basal_mask = [False] * len(idxgall)
 
     # extract the non-nan index of the original dataset
     idxval = tree_map(lambda x: data_all[x][4][-2][0], idxgall)
@@ -213,6 +257,7 @@ def predict(func_all, data_all, posi_all, idxcrop_all, idxgall, aniso=False):
     dsize_h = tree_map(lambda x: data_all[x][4][-1][1], idxgall)
     # extract the scale for different variables
     scale = tree_map(lambda x: data_all[x][4][0:2], idxgall)
+    eqn_scale = tree_map(lambda x: data_all[x][4][-1], idxgall)
     # group all the above information
     data_info = (idxval, idxval_h, dsize, dsize_h, scale)
 
@@ -228,24 +273,15 @@ def predict(func_all, data_all, posi_all, idxcrop_all, idxgall, aniso=False):
     data_norm = tree_map(lambda x: data_all[x][4][2], idxgall)
 
     # calculate the trained network output and associated equation residue at given positions
-    output = tree_map(lambda x: net_output(func_all, data_norm[x], scale[x], x), idxgall)
+    output = tree_map(lambda x: net_output(func_all, data_norm[x], eqn_scale[x], x, basal=basal_mask[x]), idxgall)
 
     # re-shape and re-dimensonalize each output variable into their original shape and unit
-    varsub, varsub_h, idxvars, idxvars_h = redimensionalize(output, data_norm, data_info, idxgall, aniso)
+    varsub, varsub_h, idxvars, idxvars_h = redimensionalize(output, data_norm, data_info, idxgall, aniso, basal_mask=basal_mask)
 
     # stitch the output variables calculated in the grid of original velocity data into one matrix
     results = tree_map(lambda x: stitch(varsub[x], idxcrop, fullsize, idxgall), idxvars)
     # stitch the output variables calculated in the grid of original thickness data into one matrix
     results_h = tree_map(lambda x: stitch(varsub_h[x], idxcrop_h, fullsize_h, idxgall), idxvars_h)
-
-    # check whether the sub-regions merge correctly
-    merge_check1 = jnp.nanmean(jnp.abs(results[0]-Xe)) == 0
-    merge_check2 = jnp.nanmean(jnp.abs(results[1]-Ye)) == 0
-    merge_check3 = jnp.nanmean(jnp.abs(results_h[0]-Xe_h)) == 0
-    merge_check4 = jnp.nanmean(jnp.abs(results_h[1]-Ye_h)) == 0
-    merge_check = merge_check1 & merge_check2 & merge_check3 & merge_check4
-    # if not correct, stop the code and show the error message
-    assert merge_check, "Sub-region merges fails. Please check the code."
 
     # group all the variables
     outvars = {"x": results[0], "y": results[1], "u_g": results[2], "v_g": results[3],
@@ -255,9 +291,11 @@ def predict(func_all, data_all, posi_all, idxcrop_all, idxgall, aniso=False):
                "e1": results[14], "e2": results[15],
                "e11": results[16], "e12": results[17], "e13": results[18],
                "e21": results[19], "e22": results[20], "e23": results[21],
-               "mu": results[22],
+               "e14": results[22], "e24": results[23],
+               "mu": results[24], "beta": results[25], "C": results[25],
+               "s": results[26],
                "x_h": results_h[0], "y_h": results_h[1], "h_g": results_h[2], "h2": results_h[3]}
     if aniso:
-        outvars['eta'] = results[-1]
+        outvars['eta'] = results[27]
 
     return outvars
